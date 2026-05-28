@@ -193,6 +193,7 @@ auth-perms-sync --help
     ```
 
     - Creates the orgs if they don't exist, and sync the members from the SAML groups to the orgs
+    - `--sync-saml-orgs` can also be added to a `--set` run, to run both at the same time
 
 ## Options
 
