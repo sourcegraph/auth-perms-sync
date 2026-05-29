@@ -5,9 +5,10 @@ This is an integration smoke runner for a real Sourcegraph test instance. It
 uses the same CLI entrypoint an operator uses (`uv run src-auth-perms-sync`) and
 checks both process exit codes and structured `run` log records.
 
-The script runs every case: read-only, dry-run, invalid-argument, no-op apply,
-mutating apply, and full overwrite/restore. Mutating cases are refused outside
-test-looking endpoints unless explicitly allowed.
+The script covers every major command path: read-only, dry-run,
+invalid-argument, no-op apply, mutating apply, and overwrite/restore. It avoids
+running the same expensive full-snapshot path more than once when another case
+already covers that behavior.
 """
 
 from __future__ import annotations
@@ -204,6 +205,7 @@ class CommandPermutationRunner:
         *,
         iteration: int,
         keep_going: bool,
+        trace: bool,
         sample_interval: float,
         external_sample_interval: float,
     ) -> None:
@@ -211,6 +213,7 @@ class CommandPermutationRunner:
         self.environment = environment
         self.iteration = iteration
         self.keep_going = keep_going
+        self.trace = trace
         self.sample_interval = sample_interval
         self.external_sample_interval = external_sample_interval
         self.results: list[CommandResult] = []
@@ -235,6 +238,7 @@ class CommandPermutationRunner:
         full_command = [
             *self.variant.executable,
             *case.arguments,
+            *(("--trace",) if self.trace else ()),
             "--sample-interval",
             str(self.sample_interval),
         ]
@@ -385,6 +389,7 @@ def main() -> None:
                 environment,
                 iteration=iteration,
                 keep_going=arguments.keep_going,
+                trace=arguments.trace,
                 sample_interval=arguments.sample_interval,
                 external_sample_interval=arguments.external_sample_interval,
             )
@@ -493,6 +498,11 @@ def parse_arguments() -> argparse.Namespace:
         "--keep-going",
         action="store_true",
         help="Continue after assertion failures where it is safe to do so",
+    )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Pass --trace to each child src-auth-perms-sync command",
     )
     parser.add_argument(
         "--sample-interval",
@@ -666,7 +676,6 @@ def run_matrix(
             )
 
     runner.run(users_without_explicit_permissions_no_op_case(arguments))
-    runner.run(sync_saml_dry_run_case())
     runner.run(sync_saml_apply_case())
     return baseline_repositories
 
@@ -674,7 +683,7 @@ def run_matrix(
 def invalid_configuration_cases(arguments: argparse.Namespace) -> list[CommandCase]:
     restore_placeholder = "definitely-missing-before.json"
     missing_maps = "definitely-missing-command-permutation-maps.yaml"
-    command_pairs = [
+    command_pairs: list[tuple[str, tuple[str, ...]]] = [
         ("get-set", ("--get", "--set", "maps.yaml")),
         ("get-restore", ("--get", "--restore", restore_placeholder)),
         ("set-restore", ("--set", "maps.yaml", "--restore", restore_placeholder)),
@@ -817,12 +826,6 @@ def read_only_cases(arguments: argparse.Namespace) -> list[CommandCase]:
             must_contain=("Selected 0 user(s) for get output",),
         ),
         CommandCase(
-            name="explicit-get-all-users",
-            arguments=("--get",),
-            expected_log_command="get",
-            must_contain=("Wrote before-snapshot",),
-        ),
-        CommandCase(
             name="get-sync-saml-orgs-dry-run",
             arguments=("--get", "--sync-saml-orgs"),
             expected_log_command="get_sync_saml_orgs",
@@ -833,22 +836,6 @@ def read_only_cases(arguments: argparse.Namespace) -> list[CommandCase]:
 
 
 def run_safe_set_cases(arguments: argparse.Namespace, runner: CommandPermutationRunner) -> None:
-    runner.run(
-        CommandCase(
-            name="set-default-full-no-op-apply",
-            arguments=(
-                "--set",
-                "--created-after",
-                arguments.future_date,
-                "--apply",
-                "--no-backup",
-                "--parallelism",
-                str(arguments.parallelism),
-            ),
-            expected_log_command="set_full",
-            must_contain=("No repos resolved across any mapping",),
-        )
-    )
     runner.run(
         CommandCase(
             name="set-explicit-full-no-op-apply",
@@ -949,15 +936,6 @@ def restore_scoped_apply_case(snapshot: Path, arguments: argparse.Namespace) -> 
     )
 
 
-def sync_saml_dry_run_case() -> CommandCase:
-    return CommandCase(
-        name="sync-saml-orgs-dry-run",
-        arguments=("--sync-saml-orgs",),
-        expected_log_command="sync_saml_orgs",
-        must_contain=("Dry run complete",),
-    )
-
-
 def sync_saml_apply_case() -> CommandCase:
     return CommandCase(
         name="sync-saml-orgs-apply",
@@ -1001,7 +979,6 @@ def run_full_apply_cases(arguments: argparse.Namespace, runner: CommandPermutati
                 must_contain=("VALIDATION OK",),
             )
         )
-        runner.run(restore_full_dry_run_case("restore-full-dry-run", baseline_snapshot, arguments))
     finally:
         runner.run(
             restore_full_apply_case(
@@ -1037,6 +1014,9 @@ def run_full_apply_cases(arguments: argparse.Namespace, runner: CommandPermutati
             )
         )
 
+    # Covers the combined set+SAML dispatch and SAML dry-run path without
+    # repeating the full set apply and full restore cleanup paths, which are
+    # already covered above.
     runner.run(
         CommandCase(
             name="set-full-sync-saml-orgs-dry-run",
@@ -1044,46 +1024,6 @@ def run_full_apply_cases(arguments: argparse.Namespace, runner: CommandPermutati
             expected_log_command="set_full_sync_saml_orgs",
             must_contain=("Dry run complete",),
         )
-    )
-    try:
-        runner.run(
-            CommandCase(
-                name="set-full-sync-saml-orgs-apply",
-                arguments=(
-                    "--set",
-                    "--sync-saml-orgs",
-                    "--apply",
-                    "--parallelism",
-                    str(arguments.parallelism),
-                ),
-                expected_log_command="set_full_sync_saml_orgs",
-                must_contain=("VALIDATION OK",),
-            )
-        )
-    finally:
-        runner.run(
-            restore_full_apply_case(
-                "restore-full-after-sync-cleanup",
-                baseline_snapshot,
-                arguments,
-                no_backup=False,
-            )
-        )
-
-
-def restore_full_dry_run_case(
-    name: str, snapshot: Path, arguments: argparse.Namespace
-) -> CommandCase:
-    return CommandCase(
-        name=name,
-        arguments=(
-            "--restore",
-            str(snapshot),
-            "--parallelism",
-            str(arguments.full_restore_parallelism),
-        ),
-        expected_log_command="restore",
-        must_contain_one_of=("Dry run complete", "Nothing to restore"),
     )
 
 
@@ -1416,7 +1356,7 @@ def print_memory_summary(results: list[CommandResult], limit: int) -> None:
     if not rows:
         print("\nMemory summary: no structured peak_rss_mb records found.")
         return
-    rows.sort(key=lambda result: result.memory.peak_rss_mb if result.memory else 0.0, reverse=True)
+    rows.sort(key=lambda result: result_peak_rss_mb(result) or 0.0, reverse=True)
     print("\nMemory summary (highest peak RSS first):")
     print(
         "variant,iteration,case,peak_rss_mib,sampled_peak_rss_mib,"
