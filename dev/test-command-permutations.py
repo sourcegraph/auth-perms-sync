@@ -14,10 +14,12 @@ already covers that behavior.
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import datetime
 import json
 import os
+import queue
 import re
 import shlex
 import statistics
@@ -25,10 +27,12 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 LOG_PATH_PATTERN = re.compile(r"Writing log events to (.+?/log\.json)\.")
@@ -36,6 +40,7 @@ DEFAULT_FUTURE_DATE = "2099-01-01"
 REMOVED_SRC_AUTH_PERMS_SYNC_ENVIRONMENT_PREFIX = "SRC_AUTH_PERMS_SYNC_"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 1.0
 DEFAULT_REPEAT_COUNT = 1
+DEFAULT_JAEGER_TRACE_LIMIT: int | None = None
 WORKLOAD_FIELDS = (
     "user_count",
     "total_users",
@@ -84,6 +89,7 @@ class CommandResult:
     phase_memory: list[PhaseMemorySummary]
     artifact_sizes: dict[str, int]
     workload: dict[str, int | float | str]
+    jaeger_traces: list[dict[str, Any]]
     elapsed_seconds: float
 
 
@@ -195,6 +201,153 @@ class ExternalProcessSampler:
         self.peak_rss_mb = max_optional_float(self.peak_rss_mb, rss_mb)
 
 
+class JaegerTraceCollector:
+    """Tail a child log and fetch Jaeger traces while the child keeps running."""
+
+    def __init__(
+        self,
+        log_path: Path,
+        environment: dict[str, str],
+        limit: int | None,
+    ) -> None:
+        self.log_path = log_path
+        self.limit = limit
+        self.endpoint = environment.get("SRC_ENDPOINT", "").rstrip("/")
+        self.access_token = environment.get("SRC_ACCESS_TOKEN", "")
+        self.summaries: list[dict[str, Any]] = []
+        self._requests_by_trace_id: dict[str, dict[str, Any]] = {}
+        self._queued_trace_ids: set[str] = set()
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._lock = threading.Lock()
+        self._log_complete = threading.Event()
+        self._started = False
+        self._tail_thread: threading.Thread | None = None
+        self._fetch_thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        scope = "all traced" if self.limit is None else f"up to {self.limit} slowest traced"
+        print(f"Collecting {scope} GraphQL Jaeger trace(s) for this case in the background ...")
+        self._tail_thread = threading.Thread(
+            target=self._tail_log,
+            name="JaegerTraceLogTail",
+            daemon=True,
+        )
+        self._fetch_thread = threading.Thread(
+            target=self._fetch_loop,
+            name="JaegerTraceFetch",
+            daemon=True,
+        )
+        self._tail_thread.start()
+        self._fetch_thread.start()
+
+    def finish_log_capture(self) -> None:
+        self._log_complete.set()
+        if self._tail_thread is not None:
+            self._tail_thread.join()
+
+    def wait(self) -> None:
+        if not self._started:
+            return
+        self.finish_log_capture()
+        if self._fetch_thread is not None:
+            self._fetch_thread.join()
+        with self._lock:
+            self.summaries.sort(key=trace_summary_duration_ms, reverse=True)
+        print_jaeger_trace_summaries(self.summaries)
+
+    def _tail_log(self) -> None:
+        while not self.log_path.exists():
+            if self._log_complete.wait(0.1):
+                self._queue_limited_requests()
+                self._queue.put(None)
+                return
+        with self.log_path.open(encoding="utf-8") as log_file:
+            while True:
+                position = log_file.tell()
+                line = log_file.readline()
+                if line:
+                    if not line.endswith("\n") and not self._log_complete.is_set():
+                        log_file.seek(position)
+                        time.sleep(0.1)
+                        continue
+                    self._record_line(line)
+                    continue
+                if self._log_complete.is_set():
+                    break
+                time.sleep(0.1)
+        self._queue_limited_requests()
+        self._queue.put(None)
+
+    def _record_line(self, line: str) -> None:
+        if not line.strip():
+            return
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(record, dict):
+            return
+        trace_request = graphql_trace_request_from_record(cast(dict[str, Any], record))
+        if trace_request is None:
+            return
+        trace_id = trace_request["trace_id"]
+        with self._lock:
+            existing_request = self._requests_by_trace_id.get(trace_id)
+            if existing_request is None or trace_summary_duration_ms(
+                trace_request
+            ) > trace_summary_duration_ms(existing_request):
+                self._requests_by_trace_id[trace_id] = trace_request
+            if self.limit is None and trace_id not in self._queued_trace_ids:
+                self._queued_trace_ids.add(trace_id)
+                self._queue.put(trace_request)
+
+    def _queue_limited_requests(self) -> None:
+        if self.limit is None:
+            return
+        with self._lock:
+            trace_requests = sorted(
+                self._requests_by_trace_id.values(),
+                key=trace_summary_duration_ms,
+                reverse=True,
+            )[: self.limit]
+            new_trace_requests = [
+                trace_request
+                for trace_request in trace_requests
+                if trace_request["trace_id"] not in self._queued_trace_ids
+            ]
+            self._queued_trace_ids.update(
+                trace_request["trace_id"] for trace_request in new_trace_requests
+            )
+        for trace_request in new_trace_requests:
+            self._queue.put(trace_request)
+
+    def _fetch_loop(self) -> None:
+        while True:
+            trace_request = self._queue.get()
+            if trace_request is None:
+                return
+            summary = self._fetch_summary(trace_request)
+            with self._lock:
+                self.summaries.append(summary)
+
+    def _fetch_summary(self, trace_request: dict[str, Any]) -> dict[str, Any]:
+        if not self.endpoint or not self.access_token:
+            return {
+                **trace_request,
+                "jaeger_found": False,
+                "error": "SRC_ENDPOINT or SRC_ACCESS_TOKEN is missing",
+            }
+        return {
+            **trace_request,
+            **fetch_jaeger_trace_summary(
+                self.endpoint, self.access_token, trace_request["trace_id"]
+            ),
+        }
+
+
 class CommandPermutationRunner:
     """Run command cases and assert CLI/log outcomes."""
 
@@ -206,6 +359,7 @@ class CommandPermutationRunner:
         iteration: int,
         keep_going: bool,
         trace: bool,
+        jaeger_trace_limit: int | None,
         sample_interval: float,
         external_sample_interval: float,
     ) -> None:
@@ -214,10 +368,12 @@ class CommandPermutationRunner:
         self.iteration = iteration
         self.keep_going = keep_going
         self.trace = trace
+        self.jaeger_trace_limit = jaeger_trace_limit
         self.sample_interval = sample_interval
         self.external_sample_interval = external_sample_interval
         self.results: list[CommandResult] = []
         self.failures: list[str] = []
+        self.jaeger_collectors: list[JaegerTraceCollector] = []
 
     def run(self, case: CommandCase) -> CommandResult:
         """Run one case, assert it, and return the captured result."""
@@ -258,20 +414,50 @@ class CommandPermutationRunner:
         external_sampler = ExternalProcessSampler(process.pid, self.external_sample_interval)
         external_sampler.start()
         output_lines: list[str] = []
+        log_path: Path | None = None
+        jaeger_collector: JaegerTraceCollector | None = None
         assert process.stdout is not None
         for line in process.stdout:
             output_lines.append(line)
             print(line, end="")
+            if log_path is None:
+                log_path = _extract_log_path(line)
+                if log_path is not None and self.trace and self.jaeger_trace_limit != 0:
+                    jaeger_collector = JaegerTraceCollector(
+                        log_path,
+                        self.environment,
+                        self.jaeger_trace_limit,
+                    )
+                    jaeger_collector.start()
         return_code = process.wait()
         external_sampler.stop()
         output = "".join(output_lines)
         elapsed_seconds = time.monotonic() - started_at
-        log_path = _extract_log_path(output)
+        if log_path is None:
+            log_path = _extract_log_path(output)
+        if (
+            jaeger_collector is None
+            and log_path is not None
+            and self.trace
+            and self.jaeger_trace_limit != 0
+        ):
+            jaeger_collector = JaegerTraceCollector(
+                log_path,
+                self.environment,
+                self.jaeger_trace_limit,
+            )
+            jaeger_collector.start()
         run_record: dict[str, Any] | None = None
         memory: MemorySummary | None = None
         phase_memory: list[PhaseMemorySummary] = []
         artifact_sizes: dict[str, int] = {}
         workload: dict[str, int | float | str] = {}
+        if jaeger_collector is not None:
+            jaeger_collector.finish_log_capture()
+            self.jaeger_collectors.append(jaeger_collector)
+            jaeger_traces = jaeger_collector.summaries
+        else:
+            jaeger_traces = []
         if log_path is not None and log_path.is_file():
             run_record, memory, phase_memory, workload = _read_run_log_summary(log_path)
             artifact_sizes = artifact_sizes_for_run(log_path)
@@ -310,6 +496,7 @@ class CommandPermutationRunner:
             phase_memory=phase_memory,
             artifact_sizes=artifact_sizes,
             workload=workload,
+            jaeger_traces=jaeger_traces,
             elapsed_seconds=elapsed_seconds,
         )
 
@@ -381,23 +568,29 @@ def main() -> None:
 
     all_results: list[CommandResult] = []
     all_failures: list[str] = []
+    all_jaeger_collectors: list[JaegerTraceCollector] = []
     latest_baseline_repositories: set[str] = set()
-    for iteration in range(1, arguments.repeat + 1):
-        for variant in variants:
-            runner = CommandPermutationRunner(
-                variant,
-                environment,
-                iteration=iteration,
-                keep_going=arguments.keep_going,
-                trace=arguments.trace,
-                sample_interval=arguments.sample_interval,
-                external_sample_interval=arguments.external_sample_interval,
-            )
-            try:
-                latest_baseline_repositories = run_matrix(arguments, runner)
-            finally:
-                all_results.extend(runner.results)
-                all_failures.extend(f"{variant.name}: {failure}" for failure in runner.failures)
+    try:
+        for iteration in range(1, arguments.repeat + 1):
+            for variant in variants:
+                runner = CommandPermutationRunner(
+                    variant,
+                    environment,
+                    iteration=iteration,
+                    keep_going=arguments.keep_going,
+                    trace=arguments.trace,
+                    jaeger_trace_limit=arguments.jaeger_trace_limit,
+                    sample_interval=arguments.sample_interval,
+                    external_sample_interval=arguments.external_sample_interval,
+                )
+                try:
+                    latest_baseline_repositories = run_matrix(arguments, runner)
+                finally:
+                    all_results.extend(runner.results)
+                    all_failures.extend(f"{variant.name}: {failure}" for failure in runner.failures)
+                    all_jaeger_collectors.extend(runner.jaeger_collectors)
+    finally:
+        wait_for_jaeger_trace_collectors(all_jaeger_collectors)
     if all_failures:
         print("\nFailures:", file=sys.stderr)
         for failure in all_failures:
@@ -505,6 +698,17 @@ def parse_arguments() -> argparse.Namespace:
         help="Pass --trace to each child src-auth-perms-sync command",
     )
     parser.add_argument(
+        "--jaeger-trace-limit",
+        type=int,
+        default=DEFAULT_JAEGER_TRACE_LIMIT,
+        metavar="N",
+        help=(
+            "When --trace is set, fetch and summarize the N slowest GraphQL "
+            "Jaeger traces while each child command runs; omit for all traces, set "
+            "0 to disable"
+        ),
+    )
+    parser.add_argument(
         "--sample-interval",
         type=float,
         default=DEFAULT_SAMPLE_INTERVAL_SECONDS,
@@ -559,6 +763,8 @@ def parse_arguments() -> argparse.Namespace:
         parser.error("--parallelism must be >= 1")
     if parsed_arguments.full_restore_parallelism < 1:
         parser.error("--full-restore-parallelism must be >= 1")
+    if parsed_arguments.jaeger_trace_limit is not None and parsed_arguments.jaeger_trace_limit < 0:
+        parser.error("--jaeger-trace-limit must be >= 0")
     if parsed_arguments.memory_summary_limit < 1:
         parser.error("--memory-summary-limit must be >= 1")
     if (
@@ -1268,6 +1474,244 @@ def artifact_sizes_for_run(log_path: Path) -> dict[str, int]:
     return sizes
 
 
+def fetch_jaeger_trace_summaries(
+    log_path: Path,
+    environment: dict[str, str],
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    """Fetch Jaeger summaries for the slowest traced GraphQL requests."""
+    collector = JaegerTraceCollector(log_path, environment, limit)
+    collector.start()
+    collector.finish_log_capture()
+    collector.wait()
+    return collector.summaries
+
+
+def wait_for_jaeger_trace_collectors(collectors: list[JaegerTraceCollector]) -> None:
+    if not collectors:
+        return
+    print(f"\nWaiting for {len(collectors)} background Jaeger trace collector(s) ...")
+    for collector in collectors:
+        collector.wait()
+
+
+def slow_graphql_trace_requests(log_path: Path, limit: int | None) -> list[dict[str, Any]]:
+    """Return the slowest unique traced GraphQL requests from one run log."""
+    requests_by_trace_id: dict[str, dict[str, Any]] = {}
+    with log_path.open(encoding="utf-8") as log_file:
+        for line in log_file:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                continue
+            trace_request = graphql_trace_request_from_record(cast(dict[str, Any], record))
+            if trace_request is None:
+                continue
+            trace_id = trace_request["trace_id"]
+            existing_request = requests_by_trace_id.get(trace_id)
+            if existing_request is None or trace_summary_duration_ms(
+                trace_request
+            ) > trace_summary_duration_ms(existing_request):
+                requests_by_trace_id[trace_id] = trace_request
+    requests = sorted(
+        requests_by_trace_id.values(),
+        key=trace_summary_duration_ms,
+        reverse=True,
+    )
+    return requests if limit is None else requests[:limit]
+
+
+def graphql_trace_request_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    if record.get("event") != "http_request" or record.get("phase") != "end":
+        return None
+    if not str(record.get("url", "")).endswith("/.api/graphql"):
+        return None
+    trace_id = trace_id_from_http_request(record)
+    if trace_id is None:
+        return None
+    return {
+        "trace_id": trace_id,
+        "trace_url": header_value(record.get("response_headers"), "x-trace-url"),
+        "duration_ms": float_field(record, "duration_ms") or 0.0,
+        "timestamp": record.get("ts"),
+        "status": record.get("status"),
+        "status_code": record.get("status_code"),
+        "error_type": record.get("error_type"),
+    }
+
+
+def trace_summary_duration_ms(summary: dict[str, Any]) -> float:
+    duration_ms = summary.get("duration_ms")
+    return float(duration_ms) if isinstance(duration_ms, int | float) else 0.0
+
+
+def trace_id_from_http_request(record: dict[str, Any]) -> str | None:
+    traceparent = header_value(record.get("request_headers"), "traceparent")
+    if traceparent is None:
+        return None
+    parts = traceparent.split("-")
+    if len(parts) != 4:
+        return None
+    trace_id = parts[1]
+    if len(trace_id) != 32 or not all(character in "0123456789abcdef" for character in trace_id):
+        return None
+    return trace_id
+
+
+def header_value(headers: object, name: str) -> str | None:
+    if not isinstance(headers, dict):
+        return None
+    typed_headers = cast(dict[object, object], headers)
+    lower_name = name.lower()
+    for header_name, value in typed_headers.items():
+        if (
+            isinstance(header_name, str)
+            and header_name.lower() == lower_name
+            and isinstance(value, str)
+        ):
+            return value
+    return None
+
+
+def fetch_jaeger_trace_summary(
+    endpoint: str,
+    access_token: str,
+    trace_id: str,
+) -> dict[str, Any]:
+    """Fetch and summarize one Jaeger trace, retrying brief ingestion lag."""
+    url = f"{endpoint}/-/debug/jaeger/api/traces/{trace_id}"
+    last_error = "trace not found"
+    for delay_seconds in (0, 2, 5):
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        request = urllib.request.Request(
+            url,
+            headers={"Authorization": f"token {access_token}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = cast(dict[str, Any], json.loads(response.read()))
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", "replace").strip()
+            last_error = f"HTTP {error.code}" + (f": {body[:200]}" if body else "")
+            if error.code in {404, 502, 503, 504}:
+                continue
+            return {"jaeger_found": False, "error": last_error}
+        except (TimeoutError, urllib.error.URLError) as error:
+            last_error = f"{type(error).__name__}: {error}"
+            continue
+
+        traces = payload.get("data")
+        if isinstance(traces, list) and traces:
+            trace = cast(object, traces[0])
+            if isinstance(trace, dict):
+                return summarize_jaeger_trace(cast(dict[str, Any], trace))
+        errors = payload.get("errors")
+        last_error = json.dumps(errors) if errors else "trace not found"
+    return {"jaeger_found": False, "error": last_error}
+
+
+def summarize_jaeger_trace(trace: dict[str, Any]) -> dict[str, Any]:
+    spans = trace.get("spans")
+    if not isinstance(spans, list):
+        return {"jaeger_found": True, "span_count": 0, "hot_operations": []}
+    typed_spans = cast(list[object], spans)
+
+    durations_by_operation: dict[str, list[float]] = collections.defaultdict(list)
+    graphql_operations: collections.Counter[str] = collections.Counter()
+    errored_spans: list[dict[str, Any]] = []
+    for span_value in typed_spans:
+        if not isinstance(span_value, dict):
+            continue
+        span = cast(dict[str, Any], span_value)
+        operation = span.get("operationName")
+        if not isinstance(operation, str):
+            operation = ""
+        duration_ms = float_field(span, "duration") or 0.0
+        duration_ms /= 1000.0
+        durations_by_operation[operation].append(duration_ms)
+        tags = jaeger_span_tags(span)
+        operation_name = tags.get("graphql.operationName")
+        if isinstance(operation_name, str):
+            graphql_operations[operation_name] += 1
+        if tags.get("error") in {True, "true", "True"}:
+            errored_spans.append(
+                {
+                    "operation": operation,
+                    "duration_ms": round(duration_ms, 1),
+                    "description": tags.get("otel.status_description"),
+                }
+            )
+
+    hot_operations = [
+        {
+            "operation": operation,
+            "count": len(durations),
+            "sum_ms": round(sum(durations), 1),
+            "max_ms": round(max(durations), 1),
+        }
+        for operation, durations in durations_by_operation.items()
+    ]
+    hot_operations.sort(key=lambda operation: float(operation["sum_ms"]), reverse=True)
+    return {
+        "jaeger_found": True,
+        "span_count": len(typed_spans),
+        "hot_operations": hot_operations[:10],
+        "graphql_operations": [
+            {"operation": operation, "count": count}
+            for operation, count in graphql_operations.most_common(10)
+        ],
+        "errored_spans": errored_spans[:5],
+    }
+
+
+def jaeger_span_tags(span: dict[str, Any]) -> dict[str, object]:
+    tags: dict[str, object] = {}
+    raw_tags = span.get("tags")
+    if not isinstance(raw_tags, list):
+        return tags
+    typed_tags = cast(list[object], raw_tags)
+    for tag_value in typed_tags:
+        if not isinstance(tag_value, dict):
+            continue
+        tag = cast(dict[str, Any], tag_value)
+        key = tag.get("key")
+        if isinstance(key, str):
+            tags[key] = tag.get("value")
+    return tags
+
+
+def print_jaeger_trace_summaries(summaries: list[dict[str, Any]]) -> None:
+    found = sum(1 for summary in summaries if summary.get("jaeger_found") is True)
+    print(f"Jaeger trace summaries: fetched {found} / {len(summaries)}.")
+    for summary in summaries:
+        duration_ms = float(summary.get("duration_ms") or 0)
+        trace_id = summary.get("trace_id")
+        if summary.get("jaeger_found") is not True:
+            print(f"  {duration_ms:.0f}ms {trace_id}: {summary.get('error')}")
+            continue
+        hot_operations = summary.get("hot_operations")
+        hot_text = ""
+        if isinstance(hot_operations, list):
+            typed_hot_operations = cast(list[object], hot_operations)
+            hot_text = "; ".join(
+                format_hot_operation(cast(dict[str, Any], operation))
+                for operation in typed_hot_operations[:3]
+                if isinstance(operation, dict)
+            )
+        print(
+            f"  {duration_ms:.0f}ms {trace_id}: {summary.get('span_count', 0)} span(s); {hot_text}"
+        )
+
+
+def format_hot_operation(operation: dict[str, Any]) -> str:
+    return (
+        f"{operation.get('operation')} x{operation.get('count')} "
+        f"sum={operation.get('sum_ms')}ms max={operation.get('max_ms')}ms"
+    )
+
+
 def process_tree_rss_mb(root_process_identifier: int) -> float | None:
     """Return current RSS for the process and descendants, in MiB."""
     try:
@@ -1558,6 +2002,11 @@ def write_results_csv(path: Path, results: list[CommandResult]) -> None:
         "max_num_fds",
         "max_num_threads",
         "max_process_cpu_percent",
+        "jaeger_trace_count",
+        "jaeger_trace_found_count",
+        "jaeger_trace_error_count",
+        "slowest_graphql_trace_ms",
+        "slowest_graphql_trace_id",
         *[f"artifact_{field_name}" for field_name in artifact_fields],
         *[f"workload_{field_name}" for field_name in workload_fields],
     ]
@@ -1648,6 +2097,7 @@ def result_to_json(result: CommandResult) -> dict[str, Any]:
         "run_directory": str(result.run_directory) if result.run_directory is not None else None,
         "command": result.run_record.get("command") if result.run_record else None,
         "status": result.run_record.get("status") if result.run_record else None,
+        "jaeger_traces": result.jaeger_traces,
         "memory": memory_to_json(result.memory),
         "phase_memory": [phase_to_json(phase) for phase in result.phase_memory],
         "artifact_sizes": result.artifact_sizes,
@@ -1725,6 +2175,15 @@ def result_to_csv_row(
         "max_process_cpu_percent": format_optional_float(
             memory.max_process_cpu_percent if memory is not None else None
         ),
+        "jaeger_trace_count": len(result.jaeger_traces),
+        "jaeger_trace_found_count": sum(
+            1 for trace in result.jaeger_traces if trace.get("jaeger_found") is True
+        ),
+        "jaeger_trace_error_count": sum(
+            1 for trace in result.jaeger_traces if trace.get("jaeger_found") is not True
+        ),
+        "slowest_graphql_trace_ms": format_optional_float(slowest_graphql_trace_ms(result)),
+        "slowest_graphql_trace_id": slowest_graphql_trace_id(result) or "",
     }
     for field_name in artifact_fields:
         row[f"artifact_{field_name}"] = result.artifact_sizes.get(field_name, "")
@@ -1743,6 +2202,20 @@ def normalized_memory(result: CommandResult) -> dict[str, float]:
         if isinstance(value, int | float) and value > 0:
             normalized[f"peak_rss_mb_per_{field_name}"] = peak_rss_mb / float(value)
     return normalized
+
+
+def slowest_graphql_trace_ms(result: CommandResult) -> float | None:
+    if not result.jaeger_traces:
+        return None
+    duration = result.jaeger_traces[0].get("duration_ms")
+    return float(duration) if isinstance(duration, int | float) else None
+
+
+def slowest_graphql_trace_id(result: CommandResult) -> str | None:
+    if not result.jaeger_traces:
+        return None
+    trace_id = result.jaeger_traces[0].get("trace_id")
+    return trace_id if isinstance(trace_id, str) else None
 
 
 def result_peak_rss_mb(result: CommandResult) -> float | None:
