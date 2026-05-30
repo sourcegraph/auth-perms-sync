@@ -64,6 +64,13 @@ If/when we revisit:
 3. Add a CLI flag (e.g. `--cross-check-capture`) gated behind a clear
    "this doubles capture cost" warning.
 
+## Low priority: Grouped full-set plan if memory is still too high
+
+Phase 1 now avoids per-repo username sets for non-overlapping full-set maps.
+If memory remains too high after re-measuring, implement the Phase 2 grouped
+plan in [mapping-efficiency.md](./mapping-efficiency.md): combine map-entry
+overlays into final groups of repos that share the same desired username tuple.
+
 ## Low priority:  Expand group-membership filters beyond SAML
 
 `allowGroups`-style enforcement exists on more than just SAML, but only

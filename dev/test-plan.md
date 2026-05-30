@@ -168,11 +168,11 @@ Use one command mode per fit (`set_full` with backup, `set_full --no-backup`,
 per-grant coefficient.
 
 On the sgdev test instance with 10,001 users and 1,023 visible repos, a
-dry-run `10000x1000` case planned 10M grants and measured about 651 MiB peak
-RSS. The grants-only fit across 14 dry-run observations was roughly 69 MiB
-fixed plus 61 bytes per planned grant. Re-measure after meaningful mapping or
-snapshot changes; these numbers describe dry-run planning memory, not apply
-mutation throughput.
+dry-run `10000x1000` case planned 10M grants. Before the lazy-union planner,
+it measured about 651 MiB peak RSS; after Phase 1 in
+[mapping-efficiency.md](./mapping-efficiency.md), the same case measured about
+68 MiB. Re-measure after meaningful mapping or snapshot changes; these numbers
+describe dry-run planning memory, not apply mutation throughput.
 
 The e2e `workload` object now uses event-aware names. In older result JSON,
 `total_users: 40004` came from `apply_username_overwrites` and meant "username

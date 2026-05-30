@@ -9,7 +9,7 @@ from typing import cast
 
 import yaml
 
-from src_auth_perms_sync.permissions import mapping, maps
+from src_auth_perms_sync.permissions import full_set, mapping, maps
 from src_auth_perms_sync.permissions import queries as permission_queries
 from src_auth_perms_sync.permissions import types as permission_types
 from src_auth_perms_sync.shared import queries as shared_queries
@@ -361,6 +361,89 @@ class MappingTests(unittest.TestCase):
         for name in names[1:]:
             matched &= sets_by_name[name]
         return matched
+
+
+class FullSetPlanningTests(unittest.TestCase):
+    def test_full_set_plan_reuses_user_tuple_for_non_overlapping_repos(self) -> None:
+        users = [self.make_user("user-1", "bob"), self.make_user("user-2", "alice")]
+        repositories = [
+            self.make_repo("repo-1", "github.com/example/one"),
+            self.make_repo("repo-2", "github.com/example/two"),
+        ]
+        context = self.make_context(
+            [
+                {
+                    "users": {"usernames": ["alice", "bob"]},
+                    "repos": {"names": ["github.com/example/one", "github.com/example/two"]},
+                }
+            ],
+            repositories,
+        )
+
+        plan = full_set.plan_full_set_permissions(context, users)
+
+        self.assertEqual(("alice", "bob"), plan.expected_users["repo-1"])
+        self.assertEqual(("alice", "bob"), plan.expected_users["repo-2"])
+        self.assertIs(plan.expected_users["repo-1"], plan.expected_users["repo-2"])
+        self.assertEqual(4, plan.total_grants)
+
+    def test_full_set_plan_unions_only_overlapping_repos(self) -> None:
+        users = [
+            self.make_user("user-1", "alice"),
+            self.make_user("user-2", "bob"),
+            self.make_user("user-3", "chris"),
+        ]
+        repositories = [
+            self.make_repo("repo-1", "github.com/example/one"),
+            self.make_repo("repo-2", "github.com/example/two"),
+            self.make_repo("repo-3", "github.com/example/three"),
+        ]
+        context = self.make_context(
+            [
+                {
+                    "users": {"usernames": ["alice", "bob"]},
+                    "repos": {"names": ["github.com/example/one", "github.com/example/two"]},
+                },
+                {
+                    "users": {"usernames": ["bob", "chris"]},
+                    "repos": {"names": ["github.com/example/two", "github.com/example/three"]},
+                },
+            ],
+            repositories,
+        )
+
+        plan = full_set.plan_full_set_permissions(context, users)
+
+        self.assertEqual(("alice", "bob"), plan.expected_users["repo-1"])
+        self.assertEqual(("alice", "bob", "chris"), plan.expected_users["repo-2"])
+        self.assertEqual(("bob", "chris"), plan.expected_users["repo-3"])
+        self.assertEqual(7, plan.total_grants)
+
+    def make_context(
+        self,
+        mapping_rules: list[permission_types.MappingRule],
+        repositories: list[permission_types.Repository],
+    ) -> permission_types.MappingContext:
+        return permission_types.MappingContext(
+            mapping_rules=mapping_rules,
+            providers=[],
+            saml_groups_attribute_names={},
+            services_by_id={},
+            repos_by_external_service_id={},
+            all_repos_by_id={repository["id"]: repository for repository in repositories},
+        )
+
+    def make_user(self, user_id: str, username: str) -> shared_types.User:
+        return {
+            "id": user_id,
+            "username": username,
+            "builtinAuth": True,
+            "emails": [],
+            "externalAccounts": {"nodes": []},
+        }
+
+    def make_repo(self, repo_id: str, name: str) -> permission_types.Repository:
+        return {"id": repo_id, "name": name}
 
 
 class QueryTests(unittest.TestCase):

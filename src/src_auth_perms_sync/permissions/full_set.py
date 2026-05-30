@@ -266,12 +266,13 @@ def _write_noop_full_set_snapshots(
     return before_path, after_path, diff_path, maps_backup_path
 
 
-def _plan_full_set_permissions(
+def plan_full_set_permissions(
     context: permission_types.MappingContext,
     users: list[shared_types.User],
 ) -> _FullSetPlan:
     """Resolve mapping rules into one repo-to-users overwrite plan."""
-    repo_usernames: dict[str, set[str]] = {}
+    expected_users: dict[str, tuple[str, ...]] = {}
+    union_usernames_by_repo_id: dict[str, set[str]] = {}
     repo_names: dict[str, str] = {}
 
     for mapping_index, mapping in enumerate(context.mapping_rules, start=1):
@@ -303,15 +304,28 @@ def _plan_full_set_permissions(
             log.warning("  No repos matched — skipping rule.")
             continue
 
-        matched_usernames = tuple(user["username"] for user in matched_users)
+        matched_usernames = tuple(sorted({user["username"] for user in matched_users}))
         for repo in matched_repos:
-            bucket = repo_usernames.setdefault(repo["id"], set())
-            repo_names[repo["id"]] = repo["name"]
-            bucket.update(matched_usernames)
+            repo_id = repo["id"]
+            repo_names[repo_id] = repo["name"]
+            union_usernames = union_usernames_by_repo_id.get(repo_id)
+            if union_usernames is not None:
+                union_usernames.update(matched_usernames)
+                continue
 
-    expected_users = {
-        repo_id: tuple(sorted(usernames)) for repo_id, usernames in repo_usernames.items()
-    }
+            existing_usernames = expected_users.get(repo_id)
+            if existing_usernames is not None:
+                union_usernames = set(existing_usernames)
+                union_usernames.update(matched_usernames)
+                union_usernames_by_repo_id[repo_id] = union_usernames
+                del expected_users[repo_id]
+                continue
+
+            expected_users[repo_id] = matched_usernames
+
+    for repo_id, usernames in union_usernames_by_repo_id.items():
+        expected_users[repo_id] = tuple(sorted(usernames))
+
     total_grants = sum(len(usernames) for usernames in expected_users.values())
     if expected_users:
         log.info(
@@ -699,7 +713,7 @@ def _load_full_set_plan(
         user_state.users,
         user_created_after,
     )
-    plan = _plan_full_set_permissions(context, users)
+    plan = plan_full_set_permissions(context, users)
     snapshot_state = _compact_full_set_snapshot_state(user_state, users)
     saml_group_users = (
         saml_groups.compact_saml_group_users(
