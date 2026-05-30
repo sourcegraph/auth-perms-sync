@@ -41,29 +41,53 @@ def list_repos_for_external_service(
     ]
 
 
-def get_user_by_username(client: src.SourcegraphClient, username: str) -> shared_types.User | None:
+def get_user_by_username(
+    client: src.SourcegraphClient,
+    username: str,
+    *,
+    include_emails: bool = False,
+) -> shared_types.User | None:
     """Return the exact Sourcegraph user for `username`, if it exists."""
     data = cast(
         dict[str, Any],
-        client.graphql(queries.QUERY_USER_BY_USERNAME, cast(src.JSONDict, {"username": username})),
+        client.graphql(
+            queries.query_user_by_username(include_emails=include_emails),
+            cast(src.JSONDict, {"username": username}),
+        ),
     )
     return cast(shared_types.User | None, data.get("user"))
 
 
-def get_user_by_email(client: src.SourcegraphClient, email: str) -> shared_types.User | None:
+def get_user_by_email(
+    client: src.SourcegraphClient,
+    email: str,
+    *,
+    include_emails: bool = False,
+) -> shared_types.User | None:
     """Return the user owning the verified email address, if it exists."""
     data = cast(
         dict[str, Any],
-        client.graphql(queries.QUERY_USER_BY_EMAIL, cast(src.JSONDict, {"email": email})),
+        client.graphql(
+            queries.query_user_by_email(include_emails=include_emails),
+            cast(src.JSONDict, {"email": email}),
+        ),
     )
     return cast(shared_types.User | None, data.get("user"))
 
 
-def get_user_by_id(client: src.SourcegraphClient, user_id: str) -> shared_types.User | None:
+def get_user_by_id(
+    client: src.SourcegraphClient,
+    user_id: str,
+    *,
+    include_emails: bool = False,
+) -> shared_types.User | None:
     """Hydrate a User node by GraphQL ID."""
     data = cast(
         dict[str, Any],
-        client.graphql(queries.QUERY_USER_BY_ID, cast(src.JSONDict, {"id": user_id})),
+        client.graphql(
+            queries.query_user_by_id(include_emails=include_emails),
+            cast(src.JSONDict, {"id": user_id}),
+        ),
     )
     return cast(shared_types.User | None, data.get("node"))
 

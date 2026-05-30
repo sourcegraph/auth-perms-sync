@@ -98,6 +98,7 @@ def _capture_full_set_snapshot_state(
     explicit_permissions_batch_size: int,
     bind_id_mode: str,
     worker_pool: ThreadPoolExecutor | None = None,
+    include_user_emails: bool = False,
 ) -> _FullSetUserState:
     """Load users while capturing the before-snapshot."""
     total_users = shared_sourcegraph.count_users(client)
@@ -110,7 +111,11 @@ def _capture_full_set_snapshot_state(
     before_timestamp = backups.backup_timestamp()
     before_snapshot = permission_snapshot.build_snapshot(
         client,
-        shared_sourcegraph.list_users_streaming(client, collect_into=users),
+        shared_sourcegraph.list_users_streaming(
+            client,
+            collect_into=users,
+            include_emails=include_user_emails,
+        ),
         parallelism,
         bind_id_mode,
         input_path,
@@ -140,6 +145,7 @@ def _load_full_set_snapshot_state(
     bind_id_mode: str,
     capture_before: bool,
     worker_pool: ThreadPoolExecutor | None = None,
+    include_user_emails: bool = False,
 ) -> _FullSetUserState:
     """Load all users, optionally with a before-snapshot."""
     if capture_before:
@@ -150,10 +156,14 @@ def _load_full_set_snapshot_state(
             explicit_permissions_batch_size,
             bind_id_mode,
             worker_pool,
+            include_user_emails=include_user_emails,
         )
 
     log.info("Loading users from %s ...", client.endpoint)
-    users = shared_sourcegraph.list_users_with_accounts(client)
+    users = shared_sourcegraph.list_users_with_accounts(
+        client,
+        include_emails=include_user_emails,
+    )
     log.info("Received %d total users.", len(users))
     return _FullSetUserState(users=users)
 
@@ -656,6 +666,7 @@ def _load_full_set_plan(
     retain_saml_group_users: bool,
     worker_pool: ThreadPoolExecutor | None = None,
 ) -> _FullSetLoadedPlan:
+    include_user_emails = permissions_mapping.mapping_rules_need_user_emails(mapping_rules)
     user_state = _load_full_set_snapshot_state(
         client,
         input_path,
@@ -664,6 +675,7 @@ def _load_full_set_plan(
         bind_id_mode,
         capture_before=capture_before,
         worker_pool=worker_pool,
+        include_user_emails=include_user_emails,
     )
     before_path: Path | None = None
     if capture_before:
